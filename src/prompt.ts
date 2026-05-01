@@ -1,58 +1,142 @@
-import type { DiffReviewComment, ReviewFile, ReviewScope, ReviewSubmitPayload } from "./types.js";
+import type {
+  DiffReviewComment,
+  ReviewItem,
+  ReviewItemNote,
+  ReviewSnapshot,
+  ReviewSubmitPayload,
+} from "./types.js";
 
-function formatScopeLabel(scope: ReviewScope): string {
-  switch (scope) {
-    case "git-diff": return "git diff";
-    case "last-commit": return "last commit";
-    default: return "all files";
-  }
+function shortSha(value: string | null): string {
+  if (value == null || value.length === 0) return "none";
+  return value.slice(0, 7);
 }
 
-function getCommentFilePath(file: ReviewFile | undefined, scope: ReviewScope): string {
-  if (file == null) return "(unknown file)";
-  const comparison = scope === "git-diff" ? file.gitDiff : scope === "last-commit" ? file.lastCommit : null;
-  return comparison?.displayPath ?? file.path;
+function formatProvenanceHeader(snapshot: ReviewSnapshot): string[] {
+  const { metadata } = snapshot;
+  return [
+    "Reviewed snapshot:",
+    `- base: ${metadata.baseRef ?? "(none)"} @ ${shortSha(metadata.mergeBaseSha)}`,
+    `- head: ${shortSha(metadata.headSha)}`,
+    `- working tree: ${metadata.workingTreeIncluded ? "included" : "clean"}`,
+  ];
 }
 
-function formatLocation(comment: DiffReviewComment, file: ReviewFile | undefined): string {
-  const filePath = getCommentFilePath(file, comment.scope);
-  const scopePrefix = `[${formatScopeLabel(comment.scope)}] `;
-
-  if (comment.side === "file" || comment.startLine == null) {
-    return `${scopePrefix}${filePath}`;
+function getItemLabel(item: ReviewItem): string {
+  if (item.kind === "working-tree") {
+    return "Working tree";
   }
-
-  const range = comment.endLine != null && comment.endLine !== comment.startLine
-    ? `${comment.startLine}-${comment.endLine}`
-    : `${comment.startLine}`;
-
-  if (comment.scope === "all-files") {
-    return `${scopePrefix}${filePath}:${range}`;
+  if (item.kind === "aggregate") {
+    return item.title;
   }
-
-  const suffix = comment.side === "original" ? " (old)" : " (new)";
-  return `${scopePrefix}${filePath}:${range}${suffix}`;
+  return `${item.title} (${item.shortSha ?? shortSha(item.commitSha)})`;
 }
 
-export function composeReviewPrompt(files: ReviewFile[], payload: ReviewSubmitPayload): string {
-  const fileMap = new Map(files.map((file) => [file.id, file]));
+function formatItemHeading(index: number, item: ReviewItem): string {
+  return `${index}. ${getItemLabel(item)}`;
+}
+
+function formatItemNote(note: ReviewItemNote): string {
+  return `   Note: ${note.body.trim()}`;
+}
+
+function formatInlineComment(comment: DiffReviewComment): string {
+  const sideSuffix = comment.side === "original" ? " (old)" : " (new)";
+  return `   - ${comment.filePath}:${comment.lineNumber}${sideSuffix} — ${comment.body.trim()}`;
+}
+
+function buildItemMap(snapshot: ReviewSnapshot): Map<string, ReviewItem> {
+  return new Map(snapshot.items.map((item) => [item.id, item]));
+}
+
+export function hasReviewFeedback(payload: ReviewSubmitPayload): boolean {
+  if (payload.overallComment.trim().length > 0) return true;
+  return (
+    payload.itemNotes.some((note) => note.body.trim().length > 0) ||
+    payload.comments.some((comment) => comment.body.trim().length > 0)
+  );
+}
+
+export function composeReviewPrompt(
+  snapshot: ReviewSnapshot,
+  payload: ReviewSubmitPayload,
+): string {
+  if (!hasReviewFeedback(payload)) return "";
+
+  const itemMap = buildItemMap(snapshot);
   const lines: string[] = [];
 
-  lines.push("Please address the following feedback");
+  lines.push("Review the diff-viewer feedback below.");
+  lines.push(
+    "Do not blindly implement every note. If feedback contains questions, ambiguity, contradictions, or anything that does not make sense, pause and close those open loops before changing code. When feedback is clear and actionable, implement the needed changes and validate them.",
+  );
+  lines.push("");
+  lines.push(...formatProvenanceHeader(snapshot));
   lines.push("");
 
   const overallComment = payload.overallComment.trim();
   if (overallComment.length > 0) {
+    lines.push("Overall review note:");
     lines.push(overallComment);
     lines.push("");
   }
 
-  payload.comments.forEach((comment, index) => {
-    const file = fileMap.get(comment.fileId);
-    lines.push(`${index + 1}. ${formatLocation(comment, file)}`);
-    lines.push(`   ${comment.body.trim()}`);
+  const itemNotesById = new Map<string, ReviewItemNote>();
+  for (const note of payload.itemNotes) {
+    const body = note.body.trim();
+    if (body.length === 0) continue;
+    itemNotesById.set(note.itemId, { ...note, body });
+  }
+
+  const commentsByItemId = new Map<string, DiffReviewComment[]>();
+  for (const comment of payload.comments) {
+    const body = comment.body.trim();
+    if (body.length === 0) continue;
+    const existing = commentsByItemId.get(comment.itemId) ?? [];
+    existing.push({ ...comment, body });
+    commentsByItemId.set(comment.itemId, existing);
+  }
+
+  let itemIndex = 1;
+  for (const item of snapshot.items) {
+    const itemNote = itemNotesById.get(item.id);
+    const inlineComments = commentsByItemId.get(item.id) ?? [];
+    if (itemNote == null && inlineComments.length === 0) {
+      continue;
+    }
+
+    lines.push(formatItemHeading(itemIndex, item));
+    itemIndex += 1;
+
+    if (itemNote != null) {
+      lines.push(formatItemNote(itemNote));
+    }
+
+    for (const comment of inlineComments) {
+      lines.push(formatInlineComment(comment));
+    }
+
     lines.push("");
-  });
+  }
+
+  for (const note of payload.itemNotes) {
+    if (itemMap.has(note.itemId)) continue;
+    const body = note.body.trim();
+    if (body.length === 0) continue;
+    lines.push(`${itemIndex}. Unknown item (${note.itemId})`);
+    itemIndex += 1;
+    lines.push(formatItemNote({ ...note, body }));
+    lines.push("");
+  }
+
+  for (const [itemId, itemComments] of commentsByItemId.entries()) {
+    if (itemMap.has(itemId)) continue;
+    lines.push(`${itemIndex}. Unknown item (${itemId})`);
+    itemIndex += 1;
+    for (const comment of itemComments) {
+      lines.push(formatInlineComment(comment));
+    }
+    lines.push("");
+  }
 
   return lines.join("\n").trim();
 }

@@ -1,11 +1,12 @@
+import { existsSync } from "node:fs";
+import { basename, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import { open, type GlimpseWindow } from "glimpseui";
-import { getReviewWindowData, loadReviewFileContents } from "./git.js";
+import { getRepoRoot, getReviewWindowData, loadReviewItemFileContents } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
 import type {
   ReviewCancelPayload,
-  ReviewFile,
   ReviewFileContents,
   ReviewHostMessage,
   ReviewRequestFilePayload,
@@ -28,8 +29,55 @@ function isRequestFilePayload(value: ReviewWindowMessage): value is ReviewReques
 
 type WaitingEditorResult = "escape" | "window-settled";
 
+interface ReviewTarget {
+  repoRoot: string;
+  label: string;
+}
+
 function escapeForInlineScript(value: string): string {
   return value.replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026");
+}
+
+function usageText(): string {
+  return "Usage: /diff-review [path:<repo-or-folder>|<repo-or-folder>]";
+}
+
+function parsePathTarget(args: string): string | null {
+  const trimmed = args.trim();
+  if (trimmed.length === 0) return null;
+  return trimmed.startsWith("path:") ? trimmed.slice("path:".length).trim() : trimmed;
+}
+
+async function resolveReviewTarget(
+  pi: ExtensionAPI,
+  cwd: string,
+  args: string,
+): Promise<ReviewTarget | { error: string }> {
+  const pathTarget = parsePathTarget(args);
+  if (pathTarget == null) {
+    try {
+      const repoRoot = await getRepoRoot(pi, cwd);
+      return { repoRoot, label: basename(repoRoot) || repoRoot };
+    } catch {
+      return { error: "Not inside a git repository. " + usageText() };
+    }
+  }
+
+  if (pathTarget.length === 0) {
+    return { error: usageText() };
+  }
+
+  const candidatePath = resolvePath(cwd, pathTarget);
+  if (!existsSync(candidatePath)) {
+    return { error: `Path does not exist: ${candidatePath}` };
+  }
+
+  try {
+    const repoRoot = await getRepoRoot(pi, candidatePath);
+    return { repoRoot, label: basename(repoRoot) || repoRoot };
+  } catch {
+    return { error: `Path is not inside a git repository: ${candidatePath}` };
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -86,7 +134,10 @@ export default function (pi: ExtensionAPI) {
           ];
           return [
             borderTop,
-            ...lines.map((line) => `${theme.fg("border", "│")}${truncateToWidth(line, innerWidth, "...", true).padEnd(innerWidth, " ")}${theme.fg("border", "│")}`),
+            ...lines.map(
+              (line) =>
+                `${theme.fg("border", "│")}${truncateToWidth(line, innerWidth, "...", true).padEnd(innerWidth, " ")}${theme.fg("border", "│")}`,
+            ),
             borderBottom,
           ];
         },
@@ -111,28 +162,38 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  async function reviewRepository(ctx: ExtensionCommandContext): Promise<void> {
+  async function reviewRepository(
+    ctx: ExtensionCommandContext,
+    target: ReviewTarget,
+  ): Promise<void> {
     if (activeWindow != null) {
       ctx.ui.notify("A review window is already open.", "warning");
       return;
     }
 
-    const { repoRoot, files } = await getReviewWindowData(pi, ctx.cwd);
-    if (files.length === 0) {
+    const { repoRoot, branchName, snapshot } = await getReviewWindowData(pi, target.repoRoot);
+    if (snapshot.items.length === 0 || snapshot.items.every((item) => item.files.length === 0)) {
       ctx.ui.notify("No reviewable files found.", "info");
       return;
     }
 
-    const html = buildReviewHtml({ repoRoot, files });
+    const html = buildReviewHtml({
+      repoLabel: target.label,
+      repoRoot,
+      branchName,
+      snapshot,
+    });
     const window = open(html, {
       width: 1680,
       height: 1020,
-      title: "pi review",
+      title: `pi diff review — ${target.label}`,
     });
     activeWindow = window;
 
     const waitingUI = showWaitingUI(ctx);
-    const fileMap = new Map(files.map((file) => [file.id, file]));
+    const itemFileMap = new Map(
+      snapshot.items.flatMap((item) => item.files.map((file) => [file.id, { item, file }])),
+    );
     const contentCache = new Map<string, Promise<ReviewFileContents>>();
 
     const sendWindowMessage = (message: ReviewHostMessage): void => {
@@ -141,99 +202,91 @@ export default function (pi: ExtensionAPI) {
       window.send(`window.__reviewReceive(${payload});`);
     };
 
-    const loadContents = (file: ReviewFile, scope: ReviewRequestFilePayload["scope"]): Promise<ReviewFileContents> => {
-      const cacheKey = `${scope}:${file.id}`;
-      const cached = contentCache.get(cacheKey);
+    const loadContents = (fileId: string): Promise<ReviewFileContents> => {
+      const cached = contentCache.get(fileId);
       if (cached != null) return cached;
 
-      const pending = loadReviewFileContents(pi, repoRoot, file, scope);
-      contentCache.set(cacheKey, pending);
+      const entry = itemFileMap.get(fileId);
+      if (entry == null) {
+        return Promise.reject(new Error("Unknown file requested."));
+      }
+
+      const pending = loadReviewItemFileContents(pi, repoRoot, entry.item, entry.file);
+      contentCache.set(fileId, pending);
       return pending;
     };
 
-    ctx.ui.notify("Opened native review window.", "info");
+    ctx.ui.notify(`Opened native review window for ${target.label}.`, "info");
 
     try {
-      const terminalMessagePromise = new Promise<ReviewSubmitPayload | ReviewCancelPayload | null>((resolve, reject) => {
-        let settled = false;
+      const terminalMessagePromise = new Promise<ReviewSubmitPayload | ReviewCancelPayload | null>(
+        (resolve, reject) => {
+          let settled = false;
 
-        const cleanup = (): void => {
-          window.removeListener("message", onMessage);
-          window.removeListener("closed", onClosed);
-          window.removeListener("error", onError);
-          if (activeWindow === window) {
-            activeWindow = null;
-          }
-        };
+          const cleanup = (): void => {
+            window.removeListener("message", onMessage);
+            window.removeListener("closed", onClosed);
+            window.removeListener("error", onError);
+            if (activeWindow === window) {
+              activeWindow = null;
+            }
+          };
 
-        const settle = (value: ReviewSubmitPayload | ReviewCancelPayload | null): void => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve(value);
-        };
+          const settle = (value: ReviewSubmitPayload | ReviewCancelPayload | null): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(value);
+          };
 
-        const handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
-          const file = fileMap.get(message.fileId);
-          if (file == null) {
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              message: "Unknown file requested.",
-            });
-            return;
-          }
+          const handleRequestFile = async (message: ReviewRequestFilePayload): Promise<void> => {
+            try {
+              const contents = await loadContents(message.fileId);
+              sendWindowMessage({
+                type: "file-data",
+                requestId: message.requestId,
+                fileId: message.fileId,
+                originalContent: contents.originalContent,
+                modifiedContent: contents.modifiedContent,
+              });
+            } catch (error) {
+              const messageText = error instanceof Error ? error.message : String(error);
+              sendWindowMessage({
+                type: "file-error",
+                requestId: message.requestId,
+                fileId: message.fileId,
+                message: messageText,
+              });
+            }
+          };
 
-          try {
-            const contents = await loadContents(file, message.scope);
-            sendWindowMessage({
-              type: "file-data",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              originalContent: contents.originalContent,
-              modifiedContent: contents.modifiedContent,
-            });
-          } catch (error) {
-            const messageText = error instanceof Error ? error.message : String(error);
-            sendWindowMessage({
-              type: "file-error",
-              requestId: message.requestId,
-              fileId: message.fileId,
-              scope: message.scope,
-              message: messageText,
-            });
-          }
-        };
+          const onMessage = (data: unknown): void => {
+            const message = data as ReviewWindowMessage;
+            if (isRequestFilePayload(message)) {
+              void handleRequestFile(message);
+              return;
+            }
+            if (isSubmitPayload(message) || isCancelPayload(message)) {
+              settle(message);
+            }
+          };
 
-        const onMessage = (data: unknown): void => {
-          const message = data as ReviewWindowMessage;
-          if (isRequestFilePayload(message)) {
-            void handleRequestFile(message);
-            return;
-          }
-          if (isSubmitPayload(message) || isCancelPayload(message)) {
-            settle(message);
-          }
-        };
+          const onClosed = (): void => {
+            settle(null);
+          };
 
-        const onClosed = (): void => {
-          settle(null);
-        };
+          const onError = (error: Error): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(error);
+          };
 
-        const onError = (error: Error): void => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          reject(error);
-        };
-
-        window.on("message", onMessage);
-        window.on("closed", onClosed);
-        window.on("error", onError);
-      });
+          window.on("message", onMessage);
+          window.on("closed", onClosed);
+          window.on("error", onError);
+        },
+      );
 
       const result = await Promise.race([
         terminalMessagePromise.then((message) => ({ type: "window" as const, message })),
@@ -258,7 +311,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const prompt = composeReviewPrompt(files, message);
+      const prompt = composeReviewPrompt(snapshot, message);
+      if (prompt.length === 0) {
+        ctx.ui.notify("No review feedback entered; editor left unchanged.", "info");
+        return;
+      }
       ctx.ui.setEditorText(prompt);
       ctx.ui.notify("Inserted review feedback into the editor.", "info");
     } catch (error) {
@@ -270,9 +327,14 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("diff-review", {
-    description: "Open a native review window with git diff, last commit, and all files scopes",
-    handler: async (_args, ctx) => {
-      await reviewRepository(ctx);
+    description: "Open a native stack-aware diff review window",
+    handler: async (args, ctx) => {
+      const target = await resolveReviewTarget(pi, ctx.cwd, args);
+      if ("error" in target) {
+        ctx.ui.notify(target.error, "warning");
+        return;
+      }
+      await reviewRepository(ctx, target);
     },
   });
 

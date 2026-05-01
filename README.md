@@ -16,13 +16,13 @@ Adds a `/diff-review` command to pi.
 
 The command:
 
-1. opens a native review window
-2. lets you switch between `git diff`, `last commit`, and `all files` scopes
-3. shows a collapsible sidebar with fuzzy file search
-4. shows git status markers in the sidebar for changed files and untracked files
-5. lazy-loads file contents on demand as you switch files and scopes
-6. lets you draft comments on the original side, modified side, or whole file
-7. inserts the resulting feedback prompt into the pi editor when you submit
+1. opens a native review window for the current repository, or for an explicit path via `/diff-review path:<repo-or-folder>`
+2. captures a stable review snapshot when the window opens: aggregate branch diff, commit-by-commit changes since the merge base, and working tree changes
+3. shows a collapsible sidebar with commit/file hierarchy, fuzzy file search, diff stats, commit metadata, and review/comment indicators
+4. detects `linguist-generated` and `linguist-vendored` files and lets you hide or show them
+5. lazy-loads file contents on demand, with a manual load step for large files
+6. lets you mark files/commits reviewed, draft overall notes, commit/item notes, and inline comments
+7. inserts a provenance-aware feedback prompt into the pi editor when you submit, including base/head/working-tree context and guidance to resolve ambiguous feedback before editing code
 
 ## Requirements
 

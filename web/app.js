@@ -5,6 +5,7 @@ const LARGE_FILE_BYTE_LIMIT = 200 * 1024;
 const LARGE_FILE_LINE_LIMIT = 3000;
 const THEME_STORAGE_KEY = "pi.diffReview.theme";
 const HIDE_GENERATED_STORAGE_KEY = "pi.diffReview.hideGenerated";
+const SIDEBAR_STORAGE_KEY = "pi.diffReview.sidebar";
 const REVIEW_THEMES = {
   dark: { label: "dark", monacoTheme: "review-dark" },
   light: { label: "light", monacoTheme: "review-light" },
@@ -25,7 +26,17 @@ function readInitialHideGenerated() {
   return false;
 }
 
+function readInitialSidebarVisible() {
+  try {
+    const stored = window.localStorage?.getItem(SIDEBAR_STORAGE_KEY);
+    if (stored === "true") return true;
+    if (stored === "false") return false;
+  } catch {}
+  return true;
+}
+
 const initialHideGenerated = readInitialHideGenerated();
+const initialSidebarVisible = readInitialSidebarVisible();
 
 function itemVisibleFiles(item, hideGenerated = state.hideGenerated) {
   if (!item) return [];
@@ -37,21 +48,31 @@ function firstItemWithFiles(hideGenerated = initialHideGenerated) {
   return snapshotItems.find((item) => itemVisibleFiles(item, hideGenerated).length > 0) || null;
 }
 
-function firstCommitItemWithFiles(hideGenerated = initialHideGenerated) {
+function firstWorkingTreeItemWithFiles(hideGenerated = initialHideGenerated) {
   return (
     snapshotItems.find(
-      (item) => item.kind !== "aggregate" && itemVisibleFiles(item, hideGenerated).length > 0,
+      (item) => item.kind === "working-tree" && itemVisibleFiles(item, hideGenerated).length > 0,
     ) || null
   );
 }
 
-const initialItem = firstCommitItemWithFiles() || firstItemWithFiles();
+function firstCommitItemWithFiles(hideGenerated = initialHideGenerated) {
+  return (
+    snapshotItems.find(
+      (item) => item.kind === "commit" && itemVisibleFiles(item, hideGenerated).length > 0,
+    ) || null
+  );
+}
+
+const initialItem =
+  firstWorkingTreeItemWithFiles() || firstCommitItemWithFiles() || firstItemWithFiles();
 
 const state = {
   activeItemId: initialItem?.id || null,
   activeFileId: initialItem?.files[0]?.id || null,
   comments: [],
   itemNotes: {},
+  fileNotes: {},
   overallComment: "",
   reviewedItems: {},
   reviewedFiles: {},
@@ -63,6 +84,7 @@ const state = {
   ),
   fileFilter: "",
   hideGenerated: initialHideGenerated,
+  sidebarVisible: initialSidebarVisible,
   wrapLines: false,
   theme: readInitialTheme(),
   pendingScrollFileId: null,
@@ -93,10 +115,13 @@ const submitButton = document.getElementById("submit-button");
 const cancelButton = document.getElementById("cancel-button");
 const overallCommentButton = document.getElementById("overall-comment-button");
 const fileCommentButton = document.getElementById("file-comment-button");
+const commitCommentButton = document.getElementById("commit-comment-button");
 const toggleReviewedButton = document.getElementById("toggle-reviewed-button");
 const toggleGeneratedButton = document.getElementById("toggle-generated-button");
 const toggleWrapButton = document.getElementById("toggle-wrap-button");
 const toggleThemeButton = document.getElementById("toggle-theme-button");
+const toggleSidebarButton = document.getElementById("toggle-sidebar-button");
+const sidebarEl = document.getElementById("sidebar");
 
 repoRootEl.textContent = reviewData.repoRoot || "";
 windowTitleEl.textContent = reviewData.repoLabel ? `Review · ${reviewData.repoLabel}` : "Review";
@@ -154,6 +179,21 @@ function applyTheme() {
     monacoApi.editor.setTheme(REVIEW_THEMES[state.theme].monacoTheme);
   }
   updateThemeButton();
+}
+
+function updateSidebarButton() {
+  if (!toggleSidebarButton) return;
+  toggleSidebarButton.textContent = `Sidebar: ${state.sidebarVisible ? "on" : "off"}`;
+  toggleSidebarButton.setAttribute(
+    "aria-label",
+    state.sidebarVisible ? "Hide sidebar" : "Show sidebar",
+  );
+}
+
+function applySidebarVisibility() {
+  if (!(sidebarEl instanceof HTMLElement)) return;
+  sidebarEl.classList.toggle("hidden", !state.sidebarVisible);
+  updateSidebarButton();
 }
 
 function inferLanguage(path) {
@@ -535,6 +575,10 @@ function reviewFileKey(file, item = activeItem()) {
   return `${item?.id || "unknown"}::${file?.path || ""}`;
 }
 
+function fileNoteKey(file = activeFile(), item = activeItem()) {
+  return `${item?.id || "unknown"}::${file?.path || ""}`;
+}
+
 function itemReviewKey(item = activeItem()) {
   return item?.id || "unknown";
 }
@@ -594,6 +638,11 @@ function itemInlineComments(item, file) {
 function currentItemNote(item = activeItem()) {
   if (!item || isAggregateItem(item)) return null;
   return state.itemNotes[item.id] || null;
+}
+
+function currentFileNote(item = activeItem(), file = activeFile()) {
+  if (!item || isAggregateItem(item) || !file) return null;
+  return state.fileNotes[fileNoteKey(file, item)] || null;
 }
 
 function canCreateItemScopedFeedback(file = activeFile(), item = activeItem()) {
@@ -901,6 +950,9 @@ function renderSidebar() {
       const note = currentItemNote(item);
       const feedbackCount =
         state.comments.filter((comment) => comment.itemId === item.id).length +
+        Object.values(state.fileNotes).filter(
+          (fileNote) => fileNote?.itemId === item.id && fileNote?.body?.trim(),
+        ).length +
         (note?.body?.trim() ? 1 : 0);
       const itemReviewed = isItemReviewed(item);
       const collapsed = state.collapsedItems[item.id] === true;
@@ -965,6 +1017,7 @@ function renderSidebar() {
   }
 
   const itemNotes = Object.values(state.itemNotes).filter((note) => note?.body?.trim()).length;
+  const fileNotes = Object.values(state.fileNotes).filter((note) => note?.body?.trim()).length;
   const comments = state.comments.length;
   const hasOverallComment = Boolean(state.overallComment?.trim());
   const filteredFileCount = itemEntries.reduce((count, entry) => count + entry.files.length, 0);
@@ -987,6 +1040,7 @@ function renderSidebar() {
   branchSummaryEl.textContent = branchParts.join(" · ");
 
   const summaryParts = [formatCount(comments, "inline comment")];
+  if (fileNotes > 0) summaryParts.push(formatCount(fileNotes, "file note"));
   if (itemNotes > 0) summaryParts.push(formatCount(itemNotes, "commit comment"));
   if (hasOverallComment) summaryParts.push(formatCount(1, "overall comment"));
 
@@ -1027,12 +1081,14 @@ function reviewButtonClass(reviewed, enabled = true) {
 
 function updateToolbarButtons() {
   const item = activeItem();
+  const file = activeFile();
   const aggregate = isAggregateItem(item);
   const explicitlyReviewed = isItemExplicitlyReviewed(item);
+  const itemLabelText = item?.kind === "working-tree" ? "Working tree" : "Commit";
 
   toggleReviewedButton.textContent = isItemReviewed(item)
-    ? "Commit reviewed"
-    : "Mark commit reviewed";
+    ? `${itemLabelText} reviewed`
+    : `Mark ${itemLabelText.toLowerCase()} reviewed`;
   toggleReviewedButton.disabled = item == null || aggregate;
   toggleReviewedButton.className = reviewButtonClass(
     isItemReviewed(item),
@@ -1041,17 +1097,28 @@ function updateToolbarButtons() {
   toggleReviewedButton.dataset.explicit = explicitlyReviewed ? "true" : "false";
   toggleReviewedButton.classList.toggle("hidden", aggregate);
 
-  fileCommentButton.textContent = "Commit comment";
-  fileCommentButton.disabled = item == null || aggregate;
+  fileCommentButton.textContent = "File comment";
+  fileCommentButton.disabled = item == null || aggregate || file == null;
   fileCommentButton.className =
-    item == null || aggregate
+    item == null || aggregate || file == null
       ? "cursor-default rounded-md border border-review-border bg-review-input px-3 py-1 text-xs font-medium text-review-muted opacity-60"
       : "cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-review-hover";
   fileCommentButton.classList.toggle("hidden", aggregate);
 
+  if (commitCommentButton) {
+    commitCommentButton.textContent = `${itemLabelText} comment`;
+    commitCommentButton.disabled = item == null || aggregate;
+    commitCommentButton.className =
+      item == null || aggregate
+        ? "cursor-default rounded-md border border-review-border bg-review-input px-3 py-1 text-xs font-medium text-review-muted opacity-60"
+        : "cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-review-hover";
+    commitCommentButton.classList.toggle("hidden", aggregate);
+  }
+
   toggleWrapButton.textContent = `Wrap lines: ${state.wrapLines ? "on" : "off"}`;
   updateGeneratedButton();
   updateThemeButton();
+  updateSidebarButton();
 }
 
 function showTextModal(options) {
@@ -1097,6 +1164,25 @@ function showItemNoteInput() {
       itemId: item.id,
       itemKind: item.kind,
       commitSha: item.commitSha,
+      body: "",
+    };
+  }
+  updateFeedbackUI();
+}
+
+function showFileNoteInput() {
+  const item = activeItem();
+  const file = activeFile();
+  if (!item || isAggregateItem(item) || !file) return;
+  const key = fileNoteKey(file, item);
+  const existing = currentFileNote(item, file);
+  if (!existing) {
+    state.fileNotes[key] = {
+      id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
+      itemId: item.id,
+      itemKind: item.kind,
+      commitSha: item.commitSha,
+      filePath: file.path,
       body: "",
     };
   }
@@ -1152,13 +1238,36 @@ function renderOverallCommentDOM() {
   return container;
 }
 
+function renderNotePanelDOM({ title, placeholder, value, onChange, onDelete, autoFocus }) {
+  const container = document.createElement("div");
+  container.className = "rounded-lg border border-review-border bg-review-panel p-4";
+  container.innerHTML = `
+    <div class="mb-2 flex items-center justify-between gap-3">
+      <div class="text-xs font-semibold text-review-text">${escapeHtml(title)}</div>
+      <button data-action="delete" class="cursor-pointer rounded-md border border-transparent bg-transparent px-2 py-1 text-xs font-medium text-review-muted hover:bg-red-500/10 hover:text-red-400">Delete</button>
+    </div>
+    <textarea class="scrollbar-thin min-h-[76px] w-full resize-y rounded-md border border-review-border bg-review-input px-3 py-2 text-sm text-review-text outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="${escapeHtml(placeholder || "Leave a note")}"></textarea>
+  `;
+  const textarea = container.querySelector("textarea");
+  textarea.value = value || "";
+  textarea.addEventListener("input", () => onChange(textarea.value));
+  container.querySelector("[data-action='delete']").addEventListener("click", onDelete);
+  if (autoFocus && !(value || "").trim()) setTimeout(() => textarea.focus(), 50);
+  return container;
+}
+
 function renderItemNoteArea() {
   fileCommentsContainer.innerHTML = "";
   const item = activeItem();
+  const file = activeFile();
   const note = currentItemNote(item);
+  const fileNote = currentFileNote(item, file);
+
   const showOverall = state.overallCommentEditing || Boolean(state.overallComment?.trim());
   const showItemNote = item != null && note != null;
-  if (!showOverall && !showItemNote) {
+  const showFileNote = item != null && file != null && fileNote != null;
+
+  if (!showOverall && !showItemNote && !showFileNote) {
     fileCommentsContainer.className = "hidden overflow-hidden px-0 py-0";
     return;
   }
@@ -1168,6 +1277,24 @@ function renderItemNoteArea() {
 
   if (showOverall) {
     fileCommentsContainer.appendChild(renderOverallCommentDOM());
+  }
+
+  if (showFileNote) {
+    fileCommentsContainer.appendChild(
+      renderNotePanelDOM({
+        title: `File note · ${getDisplayPath(file)}`,
+        placeholder: "Leave a file-level note",
+        value: fileNote.body,
+        onChange: (value) => {
+          fileNote.body = value;
+        },
+        onDelete: () => {
+          delete state.fileNotes[fileNoteKey(file, item)];
+          updateFeedbackUI();
+        },
+        autoFocus: true,
+      }),
+    );
   }
 
   if (showItemNote) {
@@ -1858,6 +1985,9 @@ submitButton.addEventListener("click", () => {
     itemNotes: Object.values(state.itemNotes)
       .map((note) => ({ ...note, body: note.body.trim() }))
       .filter((note) => note.body.length > 0),
+    fileNotes: Object.values(state.fileNotes)
+      .map((note) => ({ ...note, body: note.body.trim() }))
+      .filter((note) => note.body.length > 0),
     comments: state.comments
       .map((comment) => ({ ...comment, body: comment.body.trim() }))
       .filter((comment) => comment.body.length > 0),
@@ -1876,8 +2006,14 @@ overallCommentButton.addEventListener("click", () => {
 });
 
 fileCommentButton.addEventListener("click", () => {
-  showItemNoteInput();
+  showFileNoteInput();
 });
+
+if (commitCommentButton) {
+  commitCommentButton.addEventListener("click", () => {
+    showItemNoteInput();
+  });
+}
 
 toggleGeneratedButton.addEventListener("click", () => {
   state.hideGenerated = !state.hideGenerated;
@@ -1899,6 +2035,14 @@ toggleWrapButton.addEventListener("click", () => {
 toggleThemeButton.addEventListener("click", () => {
   state.theme = state.theme === "dark" ? "light" : "dark";
   applyTheme();
+});
+
+toggleSidebarButton?.addEventListener("click", () => {
+  state.sidebarVisible = !state.sidebarVisible;
+  try {
+    window.localStorage?.setItem(SIDEBAR_STORAGE_KEY, String(state.sidebarVisible));
+  } catch {}
+  applySidebarVisibility();
 });
 
 toggleReviewedButton.addEventListener("click", () => {
@@ -1946,6 +2090,7 @@ collapseAllCommitsButton.addEventListener("click", () => {
 
 applyTheme();
 ensureActiveSelection();
+applySidebarVisibility();
 renderSidebar();
 renderHeader();
 renderItemNoteArea();

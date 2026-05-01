@@ -202,6 +202,12 @@
             Theme: dark
           </button>
           <button
+            id="toggle-sidebar-button"
+            class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1.5 text-xs font-medium text-review-text hover:bg-review-hover"
+          >
+            Sidebar: on
+          </button>
+          <button
             id="overall-comment-button"
             class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1.5 text-xs font-medium text-review-text hover:bg-review-hover"
           >
@@ -282,7 +288,13 @@
                 id="file-comment-button"
                 class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-review-hover"
               >
-                Add file comment
+                File comment
+              </button>
+              <button
+                id="commit-comment-button"
+                class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-review-hover"
+              >
+                Commit comment
               </button>
               <button
                 id="toggle-reviewed-button"

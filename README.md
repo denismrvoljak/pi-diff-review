@@ -21,7 +21,7 @@ The command:
 3. shows a collapsible sidebar with commit/file hierarchy, fuzzy file search, diff stats, commit metadata, and review/comment indicators
 4. detects `linguist-generated` and `linguist-vendored` files and lets you hide or show them
 5. lazy-loads file contents on demand, with a manual load step for large files
-6. lets you mark files/commits reviewed, draft overall notes, commit/item notes, and inline comments
+6. lets you mark files/commits reviewed, draft overall notes, commit/item notes, file-level notes, and inline comments
 7. inserts a provenance-aware feedback prompt into the pi editor when you submit, including base/head/working-tree context and guidance to resolve ambiguous feedback before editing code
 
 ## Requirements

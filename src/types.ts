@@ -91,6 +91,15 @@ export interface ReviewItemNote {
   body: string;
 }
 
+export interface ReviewFileNote {
+  id: string;
+  itemId: string;
+  itemKind: ReviewItemKind;
+  commitSha: string | null;
+  filePath: string;
+  body: string;
+}
+
 export interface DiffReviewComment {
   id: string;
   itemId: string;
@@ -106,6 +115,7 @@ export interface ReviewSubmitPayload {
   type: "submit";
   overallComment: string;
   itemNotes: ReviewItemNote[];
+  fileNotes: ReviewFileNote[];
   comments: DiffReviewComment[];
 }
 

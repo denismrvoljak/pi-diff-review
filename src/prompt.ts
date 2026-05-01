@@ -1,5 +1,6 @@
 import type {
   DiffReviewComment,
+  ReviewFileNote,
   ReviewItem,
   ReviewItemNote,
   ReviewSnapshot,
@@ -39,6 +40,10 @@ function formatItemNote(note: ReviewItemNote): string {
   return `   Note: ${note.body.trim()}`;
 }
 
+function formatFileNote(note: ReviewFileNote): string {
+  return `   File: ${note.filePath} — ${note.body.trim()}`;
+}
+
 function formatInlineComment(comment: DiffReviewComment): string {
   const sideSuffix = comment.side === "original" ? " (old)" : " (new)";
   return `   - ${comment.filePath}:${comment.lineNumber}${sideSuffix} — ${comment.body.trim()}`;
@@ -52,6 +57,7 @@ export function hasReviewFeedback(payload: ReviewSubmitPayload): boolean {
   if (payload.overallComment.trim().length > 0) return true;
   return (
     payload.itemNotes.some((note) => note.body.trim().length > 0) ||
+    payload.fileNotes.some((note) => note.body.trim().length > 0) ||
     payload.comments.some((comment) => comment.body.trim().length > 0)
   );
 }
@@ -87,6 +93,15 @@ export function composeReviewPrompt(
     itemNotesById.set(note.itemId, { ...note, body });
   }
 
+  const fileNotesByItemId = new Map<string, ReviewFileNote[]>();
+  for (const note of payload.fileNotes) {
+    const body = note.body.trim();
+    if (body.length === 0) continue;
+    const existing = fileNotesByItemId.get(note.itemId) ?? [];
+    existing.push({ ...note, body });
+    fileNotesByItemId.set(note.itemId, existing);
+  }
+
   const commentsByItemId = new Map<string, DiffReviewComment[]>();
   for (const comment of payload.comments) {
     const body = comment.body.trim();
@@ -99,8 +114,9 @@ export function composeReviewPrompt(
   let itemIndex = 1;
   for (const item of snapshot.items) {
     const itemNote = itemNotesById.get(item.id);
+    const fileNotes = fileNotesByItemId.get(item.id) ?? [];
     const inlineComments = commentsByItemId.get(item.id) ?? [];
-    if (itemNote == null && inlineComments.length === 0) {
+    if (itemNote == null && fileNotes.length === 0 && inlineComments.length === 0) {
       continue;
     }
 
@@ -109,6 +125,10 @@ export function composeReviewPrompt(
 
     if (itemNote != null) {
       lines.push(formatItemNote(itemNote));
+    }
+
+    for (const note of fileNotes) {
+      lines.push(formatFileNote(note));
     }
 
     for (const comment of inlineComments) {
@@ -125,6 +145,16 @@ export function composeReviewPrompt(
     lines.push(`${itemIndex}. Unknown item (${note.itemId})`);
     itemIndex += 1;
     lines.push(formatItemNote({ ...note, body }));
+    lines.push("");
+  }
+
+  for (const note of payload.fileNotes) {
+    if (itemMap.has(note.itemId)) continue;
+    const body = note.body.trim();
+    if (body.length === 0) continue;
+    lines.push(`${itemIndex}. Unknown item (${note.itemId})`);
+    itemIndex += 1;
+    lines.push(formatFileNote({ ...note, body }));
     lines.push("");
   }
 

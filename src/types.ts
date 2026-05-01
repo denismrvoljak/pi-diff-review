@@ -93,9 +93,6 @@ export interface ReviewItemNote {
 
 export interface ReviewFileNote {
   id: string;
-  itemId: string;
-  itemKind: ReviewItemKind;
-  commitSha: string | null;
   filePath: string;
   body: string;
 }

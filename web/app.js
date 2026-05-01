@@ -6,6 +6,7 @@ const LARGE_FILE_LINE_LIMIT = 3000;
 const THEME_STORAGE_KEY = "pi.diffReview.theme";
 const HIDE_GENERATED_STORAGE_KEY = "pi.diffReview.hideGenerated";
 const SIDEBAR_STORAGE_KEY = "pi.diffReview.sidebar";
+const SCOPE_STORAGE_KEY = "pi.diffReview.scope";
 const REVIEW_THEMES = {
   dark: { label: "dark", monacoTheme: "review-dark" },
   light: { label: "light", monacoTheme: "review-light" },
@@ -35,8 +36,17 @@ function readInitialSidebarVisible() {
   return true;
 }
 
+function readInitialScope() {
+  try {
+    const stored = window.localStorage?.getItem(SCOPE_STORAGE_KEY);
+    if (stored === "all" || stored === "working-tree") return stored;
+  } catch {}
+  return "working-tree";
+}
+
 const initialHideGenerated = readInitialHideGenerated();
 const initialSidebarVisible = readInitialSidebarVisible();
+const initialScope = readInitialScope();
 
 function itemVisibleFiles(item, hideGenerated = state.hideGenerated) {
   if (!item) return [];
@@ -73,6 +83,7 @@ const state = {
   comments: [],
   itemNotes: {},
   fileNotes: {},
+  fileNoteEditingPath: null,
   overallComment: "",
   reviewedItems: {},
   reviewedFiles: {},
@@ -85,6 +96,7 @@ const state = {
   fileFilter: "",
   hideGenerated: initialHideGenerated,
   sidebarVisible: initialSidebarVisible,
+  scope: initialScope,
   wrapLines: false,
   theme: readInitialTheme(),
   pendingScrollFileId: null,
@@ -114,12 +126,12 @@ const editorContainerEl = document.getElementById("editor-container");
 const submitButton = document.getElementById("submit-button");
 const cancelButton = document.getElementById("cancel-button");
 const overallCommentButton = document.getElementById("overall-comment-button");
-const fileCommentButton = document.getElementById("file-comment-button");
 const commitCommentButton = document.getElementById("commit-comment-button");
 const toggleReviewedButton = document.getElementById("toggle-reviewed-button");
 const toggleGeneratedButton = document.getElementById("toggle-generated-button");
 const toggleWrapButton = document.getElementById("toggle-wrap-button");
 const toggleThemeButton = document.getElementById("toggle-theme-button");
+const toggleScopeButton = document.getElementById("toggle-scope-button");
 const toggleSidebarButton = document.getElementById("toggle-sidebar-button");
 const sidebarEl = document.getElementById("sidebar");
 
@@ -194,6 +206,28 @@ function applySidebarVisibility() {
   if (!(sidebarEl instanceof HTMLElement)) return;
   sidebarEl.classList.toggle("hidden", !state.sidebarVisible);
   updateSidebarButton();
+}
+
+function updateScopeButton() {
+  if (!toggleScopeButton) return;
+  const label = state.scope === "all" ? "all commits" : "working tree";
+  toggleScopeButton.textContent = `Scope: ${label}`;
+  toggleScopeButton.setAttribute(
+    "aria-label",
+    state.scope === "all" ? "Show working tree only" : "Show all commits",
+  );
+}
+
+function visibleItems() {
+  const hideGenerated = state.hideGenerated;
+  const items =
+    state.scope === "working-tree"
+      ? snapshotItems.filter((item) => item.kind === "working-tree")
+      : snapshotItems;
+  return items
+    .map((item) => ({ item, files: itemVisibleFiles(item, hideGenerated) }))
+    .filter((entry) => entry.files.length > 0)
+    .map((entry) => entry.item);
 }
 
 function inferLanguage(path) {
@@ -538,7 +572,8 @@ function renderSidebarIndicators({ reviewed = false, commentCount = 0, placehold
 }
 
 function activeItem() {
-  return snapshotItems.find((item) => item.id === state.activeItemId) || null;
+  const list = state.scope === "working-tree" ? snapshotItems.filter((i) => i.kind === "working-tree") : snapshotItems;
+  return list.find((item) => item.id === state.activeItemId) || list[0] || null;
 }
 
 function activeFile() {
@@ -551,7 +586,10 @@ function activeFile() {
 function ensureActiveSelection() {
   const item = activeItem();
   if (item == null || itemVisibleFiles(item).length === 0) {
-    const fallback = firstItemWithFiles(state.hideGenerated);
+    const fallback =
+      state.scope === "working-tree"
+        ? firstWorkingTreeItemWithFiles(state.hideGenerated)
+        : firstItemWithFiles(state.hideGenerated);
     const fallbackFiles = itemVisibleFiles(fallback);
     state.activeItemId = fallback?.id || null;
     state.activeFileId = fallbackFiles[0]?.id || null;
@@ -575,8 +613,8 @@ function reviewFileKey(file, item = activeItem()) {
   return `${item?.id || "unknown"}::${file?.path || ""}`;
 }
 
-function fileNoteKey(file = activeFile(), item = activeItem()) {
-  return `${item?.id || "unknown"}::${file?.path || ""}`;
+function fileNoteKey(file = activeFile()) {
+  return file?.path || "";
 }
 
 function itemReviewKey(item = activeItem()) {
@@ -640,9 +678,9 @@ function currentItemNote(item = activeItem()) {
   return state.itemNotes[item.id] || null;
 }
 
-function currentFileNote(item = activeItem(), file = activeFile()) {
-  if (!item || isAggregateItem(item) || !file) return null;
-  return state.fileNotes[fileNoteKey(file, item)] || null;
+function currentFileNote(_item = activeItem(), file = activeFile()) {
+  if (!file) return null;
+  return state.fileNotes[fileNoteKey(file)] || null;
 }
 
 function canCreateItemScopedFeedback(file = activeFile(), item = activeItem()) {
@@ -700,10 +738,11 @@ function collectDirectoryFiles(directory) {
 }
 
 function directoryCommentCount(directory, item) {
-  return collectDirectoryFiles(directory).reduce(
-    (count, file) => count + itemInlineComments(item, file).length,
-    0,
-  );
+  return collectDirectoryFiles(directory).reduce((count, file) => {
+    const inlineCount = itemInlineComments(item, file).length;
+    const fileNote = state.fileNotes[file.path];
+    return count + inlineCount + (fileNote?.body?.trim() ? 1 : 0);
+  }, 0);
 }
 
 function renderSidebarFileLeaf(container, item, file, depth) {
@@ -711,7 +750,9 @@ function renderSidebarFileLeaf(container, item, file, depth) {
   const loading = requestState.requestId != null && requestState.contents == null;
   const errored = requestState.error != null;
   const reviewed = isFileReviewed(file, item);
-  const commentCount = itemInlineComments(item, file).length;
+  const inlineCount = itemInlineComments(item, file).length;
+  const fileNote = state.fileNotes[file.path];
+  const commentCount = inlineCount + (fileNote?.body?.trim() ? 1 : 0);
   const status = file.comparison?.status || null;
   const baseName = file.path.split("/").pop() || file.path;
   const indentPx = 8;
@@ -795,16 +836,23 @@ function renderSidebarFileTree(container, item, files) {
   }
 }
 
+function scopedSnapshotItems() {
+  return state.scope === "working-tree"
+    ? snapshotItems.filter((item) => item.kind === "working-tree")
+    : snapshotItems;
+}
+
 function getFilteredItems() {
+  const items = scopedSnapshotItems();
   const query = state.fileFilter.trim();
   if (!query) {
-    return snapshotItems
+    return items
       .map((item) => ({ item, files: itemVisibleFiles(item), score: 0 }))
       .filter((entry) => entry.files.length > 0);
   }
 
   const normalizedQuery = normalizeQuery(query);
-  return snapshotItems
+  return items
     .map((item) => {
       const itemScore = scoreSubsequence(normalizedQuery, itemLabel(item).toLowerCase());
       const files = itemVisibleFiles(item)
@@ -950,9 +998,6 @@ function renderSidebar() {
       const note = currentItemNote(item);
       const feedbackCount =
         state.comments.filter((comment) => comment.itemId === item.id).length +
-        Object.values(state.fileNotes).filter(
-          (fileNote) => fileNote?.itemId === item.id && fileNote?.body?.trim(),
-        ).length +
         (note?.body?.trim() ? 1 : 0);
       const itemReviewed = isItemReviewed(item);
       const collapsed = state.collapsedItems[item.id] === true;
@@ -1028,8 +1073,9 @@ function renderSidebar() {
   const filteredSuffix = state.fileFilter.trim()
     ? ` · ${formatCount(filteredFileCount, "file")} shown${generatedSuffix}`
     : generatedSuffix;
-  const hasWorkingTreeItem = snapshotItems.some((item) => item.kind === "working-tree");
+    const hasWorkingTreeItem = snapshotItems.some((item) => item.kind === "working-tree");
   const commitItemCount = snapshotItems.filter((item) => item.kind === "commit").length;
+  const scopeSuffix = state.scope === "working-tree" ? " · working tree only" : "";
   const branchParts = [];
   if (reviewData.branchName) branchParts.push(reviewData.branchName);
   branchParts.push(
@@ -1037,7 +1083,7 @@ function renderSidebar() {
       ? `${formatCount(commitItemCount, "commit")} · dirty working tree`
       : formatCount(commitItemCount, "commit"),
   );
-  branchSummaryEl.textContent = branchParts.join(" · ");
+  branchSummaryEl.textContent = branchParts.join(" · ") + scopeSuffix;
 
   const summaryParts = [formatCount(comments, "inline comment")];
   if (fileNotes > 0) summaryParts.push(formatCount(fileNotes, "file note"));
@@ -1081,7 +1127,6 @@ function reviewButtonClass(reviewed, enabled = true) {
 
 function updateToolbarButtons() {
   const item = activeItem();
-  const file = activeFile();
   const aggregate = isAggregateItem(item);
   const explicitlyReviewed = isItemExplicitlyReviewed(item);
   const itemLabelText = item?.kind === "working-tree" ? "Working tree" : "Commit";
@@ -1096,14 +1141,6 @@ function updateToolbarButtons() {
   );
   toggleReviewedButton.dataset.explicit = explicitlyReviewed ? "true" : "false";
   toggleReviewedButton.classList.toggle("hidden", aggregate);
-
-  fileCommentButton.textContent = "File comment";
-  fileCommentButton.disabled = item == null || aggregate || file == null;
-  fileCommentButton.className =
-    item == null || aggregate || file == null
-      ? "cursor-default rounded-md border border-review-border bg-review-input px-3 py-1 text-xs font-medium text-review-muted opacity-60"
-      : "cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1 text-xs font-medium text-review-text hover:bg-review-hover";
-  fileCommentButton.classList.toggle("hidden", aggregate);
 
   if (commitCommentButton) {
     commitCommentButton.textContent = `${itemLabelText} comment`;
@@ -1171,17 +1208,14 @@ function showItemNoteInput() {
 }
 
 function showFileNoteInput() {
-  const item = activeItem();
   const file = activeFile();
-  if (!item || isAggregateItem(item) || !file) return;
-  const key = fileNoteKey(file, item);
-  const existing = currentFileNote(item, file);
+  if (!file) return;
+  const key = fileNoteKey(file);
+  state.fileNoteEditingPath = key;
+  const existing = currentFileNote(null, file);
   if (!existing) {
     state.fileNotes[key] = {
       id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
-      itemId: item.id,
-      itemKind: item.kind,
-      commitSha: item.commitSha,
       filePath: file.path,
       body: "",
     };
@@ -1265,7 +1299,9 @@ function renderItemNoteArea() {
 
   const showOverall = state.overallCommentEditing || Boolean(state.overallComment?.trim());
   const showItemNote = item != null && note != null;
-  const showFileNote = item != null && file != null && fileNote != null;
+  const showFileNote =
+    file != null &&
+    (state.fileNoteEditingPath === file.path || Boolean(fileNote?.body?.trim()));
 
   if (!showOverall && !showItemNote && !showFileNote) {
     fileCommentsContainer.className = "hidden overflow-hidden px-0 py-0";
@@ -1289,7 +1325,8 @@ function renderItemNoteArea() {
           fileNote.body = value;
         },
         onDelete: () => {
-          delete state.fileNotes[fileNoteKey(file, item)];
+          delete state.fileNotes[fileNoteKey(file)];
+          if (state.fileNoteEditingPath === file.path) state.fileNoteEditingPath = null;
           updateFeedbackUI();
         },
         autoFocus: true,
@@ -1853,6 +1890,24 @@ function renderDocument() {
       rerenderDocumentPreservingScroll();
     });
 
+    const fileNote = currentFileNote(item, file);
+    const hasFileNote = Boolean(fileNote?.body?.trim());
+    const fileNoteButton = document.createElement("button");
+    fileNoteButton.type = "button";
+    fileNoteButton.className = hasFileNote
+      ? "cursor-pointer border-0 bg-transparent p-0 text-xs font-medium text-review-text underline underline-offset-2"
+      : "cursor-pointer border-0 bg-transparent p-0 text-xs font-medium text-review-muted underline-offset-2 hover:text-review-text hover:underline";
+    fileNoteButton.textContent = hasFileNote ? "File note" : "Add file note";
+    fileNoteButton.setAttribute(
+      "aria-label",
+      hasFileNote ? `Edit file note for ${getDisplayPath(file)}` : `Add file note for ${getDisplayPath(file)}`,
+    );
+    fileNoteButton.addEventListener("click", () => {
+      openFile(file.id, item.id, false);
+      showFileNoteInput();
+    });
+
+    headerActions.appendChild(fileNoteButton);
     if (file.comparison != null) headerActions.appendChild(fullFileButton);
     if (!isAggregateItem(item)) {
       headerActions.appendChild(reviewedButton);
@@ -2005,10 +2060,6 @@ overallCommentButton.addEventListener("click", () => {
   showOverallCommentInput();
 });
 
-fileCommentButton.addEventListener("click", () => {
-  showFileNoteInput();
-});
-
 if (commitCommentButton) {
   commitCommentButton.addEventListener("click", () => {
     showItemNoteInput();
@@ -2088,7 +2139,22 @@ collapseAllCommitsButton.addEventListener("click", () => {
   renderSidebar();
 });
 
+toggleScopeButton?.addEventListener("click", () => {
+  state.scope = state.scope === "all" ? "working-tree" : "all";
+  try {
+    window.localStorage?.setItem(SCOPE_STORAGE_KEY, String(state.scope));
+  } catch {}
+  ensureActiveSelection();
+  updateScopeButton();
+  renderSidebar();
+  renderHeader();
+  renderItemNoteArea();
+  renderDocument();
+  updateToolbarButtons();
+});
+
 applyTheme();
+updateScopeButton();
 ensureActiveSelection();
 applySidebarVisibility();
 renderSidebar();
